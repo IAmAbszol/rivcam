@@ -7,7 +7,7 @@ from typing import List
 
 def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
-    return p
+    return p.absolute()
 
 
 def list_videos(root: Path, exts=(".mp4", ".mov", ".m4v")) -> List[Path]:

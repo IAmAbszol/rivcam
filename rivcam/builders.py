@@ -1,88 +1,151 @@
-
 from __future__ import annotations
 
 import datetime as dt
-from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from rivcam.common import Clip
-from rivcam.common import ClipV1
-from rivcam.common import Group
-from rivcam.common import GroupV1
-from rivcam.parsers import Version
-from rivcam.parsers import get_spec
+from rivcam.build_dispatch import register, resolve
+from rivcam.common import Clip, ClipV1, Group, GroupV1
+from rivcam.parsers import Version, get_spec, latest_version
 from rivcam.utils.logging import LOGGER
+from rivcam.utils.time import UTC
 
 
-def _parse_filename_v1(path: Path, spec) -> Optional[tuple[dt.datetime, str]]:
-    m = spec.pattern.search(path.name)
-    if not m:
-        return None
-    yy = int(m["yy"])
-    year = 2000 + yy if yy < 80 else 1900 + yy
-    ts = dt.datetime(
-        year, int(m["mm"]), int(m["dd"]),
-        int(m["hh"]), int(m["mi"]), int(m["ss"]),
-        tzinfo=dt.timezone.utc
+__all__ = ["build_clip", "build_groups"]
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_clips_from_root(root: Path, media_glob: str, *, spec_version: Version) -> List[Clip]:
+    """
+    Discover media files under `root` using the spec's media_glob and convert to clips
+    via the versioned clip builder.
+    """
+    clips: List[Clip] = []
+    for path in root.rglob(media_glob):
+        if not path.is_file():
+            continue
+        c = build_clip(path, version=spec_version)
+        if c is not None:
+            clips.append(c)
+    return clips
+
+
+# ---------------------------------------------------------------------------
+# V1 implementations
+# ---------------------------------------------------------------------------
+
+@register(event="build_clip", version=Version.V1)
+def _build_clip_v1(path: Path, *, spec) -> Optional[ClipV1]:
+    """
+    V1 clip builder.
+
+    The spec is expected to expose `parse_clip(path) -> Clip | None`.
+    """
+    clip = spec.parse_clip(path)
+    if clip is None:
+        LOGGER.debug("V1 clip builder: %s did not match spec %s", path, spec.name)
+    else:
+        LOGGER.debug(
+            "V1 clip builder: built clip %s (camera=%s, start=%s)",
+            clip.filename,
+            getattr(clip, "camera_id", None),
+            clip.get_date(),
+        )
+    return clip
+
+
+@register(event="build_groups", version=Version.V1)
+def _build_groups_v1(
+    root_or_clips: Union[Path, Iterable[Clip]],
+    *,
+    spec,
+    gap_tolerance_s: float = 60.0,
+) -> List[GroupV1]:
+    """
+    V1 group builder.
+
+    If given a Path, we discover media files under it and parse them to clips.
+    If given an iterable of clips, we group those directly.
+    """
+    if isinstance(root_or_clips, Path):
+        base_folder = root_or_clips.resolve()
+        clips = _ensure_clips_from_root(base_folder, spec.media_glob, spec_version=spec.version)
+    else:
+        base_folder = Path(".").resolve()
+        clips = list(root_or_clips)
+
+    if not clips:
+        LOGGER.info("V1 group builder: no clips to group")
+        return []
+
+    # spec is the thing that knows how to group by time window
+    windows: List[Tuple[dt.datetime, dt.datetime, Tuple[Clip, ...]]] = spec.group_clips(
+        clips,
+        gap_tolerance_s=gap_tolerance_s,
     )
-    cam = spec.postprocess_camera(m["cam"])
-    return ts, cam
 
-
-def build_clip(path: Path, *, version: Optional[Version] = None) -> Optional[Clip]:
-    spec = get_spec(version)
-    if spec.version == Version.V1:
-        parsed = _parse_filename_v1(path, spec)
-        if not parsed:
-            LOGGER.debug("Skipping (filename did not match V1): %s", path.name)
-            return None
-        start_utc, camera = parsed
-        return ClipV1(filename=path.name, path=path, start_utc=start_utc, camera_id=camera)
-    LOGGER.error("Unsupported version requested: %s", spec.version)
-    return None
-
-
-def _derive_group_name_v1(folder: Path, start: dt.datetime, end: dt.datetime) -> str:
-    def fmt(d: dt.datetime) -> str:
-        return d.strftime("%Y%m%d_%H%M%S")
-    return f"{folder.name}__{fmt(start)}__{fmt(end)}"
-
-
-def build_groups(clips: Sequence[Clip], *, version: Optional[Version] = None, gap_tolerance_s: float = 60.0) -> List[Group]:
-    spec = get_spec(version)
-    if spec.version != Version.V1:
-        raise RuntimeError(f"Unsupported version for grouping: {spec.version}")
-
-    by_dir: dict[Path, list[ClipV1]] = defaultdict(list)
-    for c in clips:
-        if not isinstance(c, ClipV1):
-            continue
-        by_dir[c.path.parent].append(c)
-
-    groups: List[Group] = []
-    for folder, arr in sorted(by_dir.items()):
-        arr.sort(key=lambda x: x.get_date())
-        if not arr:
-            continue
-        current: list[ClipV1] = [arr[0]]
-        win_start = arr[0].get_date()
-        win_end_ts = arr[0].get_date().timestamp() + arr[0].duration()
-
-        for c in arr[1:]:
-            delta = c.get_date().timestamp() - win_end_ts
-            if delta <= gap_tolerance_s:
-                current.append(c)
-                win_end_ts = max(win_end_ts, c.get_date().timestamp() + c.duration())
-            else:
-                name = _derive_group_name_v1(folder, win_start, dt.datetime.fromtimestamp(win_end_ts, tz=dt.timezone.utc))
-                groups.append(GroupV1(name=name, clips=tuple(current), folder=folder))
-                current = [c]
-                win_start = c.get_date()
-                win_end_ts = c.get_date().timestamp() + c.duration()
-
-        if current:
-            name = _derive_group_name_v1(folder, win_start, dt.datetime.fromtimestamp(win_end_ts, tz=dt.timezone.utc))
-            groups.append(GroupV1(name=name, clips=tuple(current), folder=folder))
+    groups: List[GroupV1] = []
+    for start_dt, end_dt, window_clips in windows:
+        name = spec.group_name(base_folder, start_dt, end_dt)
+        grp = GroupV1(name=name, clips=list(window_clips), folder=base_folder)
+        groups.append(grp)
+        LOGGER.debug(
+            "V1 group builder: built group %s (%d clips) [%s – %s]",
+            name,
+            len(window_clips),
+            start_dt.isoformat(),
+            end_dt.isoformat(),
+        )
 
     return groups
+
+
+# ---------------------------------------------------------------------------
+# public API
+# ---------------------------------------------------------------------------
+
+def build_clip(path: Path, *, version: Optional[Version] = None) -> Optional[Clip]:
+    """
+    Build a Clip from a media path using the versioned builder.
+
+    Args:
+        path: Path to media file.
+        version: Optional parser/builder version; if omitted, use the latest registered.
+
+    Returns:
+        Clip instance or None if the path does not match the spec.
+    """
+    v = version or latest_version()
+    spec = get_spec(v)
+    fn = resolve("build_clip", v)
+    return fn(path, spec=spec)
+
+
+def build_groups(
+    root: Union[Path, Iterable[Clip]],
+    *,
+    version: Optional[Version] = None,
+    gap_tolerance_s: float = 60.0,
+) -> List[Group]:
+    """
+    Build groups from either:
+      - a root directory of media files, or
+      - a pre-parsed iterable of Clip objects.
+
+    This is what your test_grouping.py and test_stitching.py call.
+
+    Args:
+        root: directory or iterable of Clip
+        version: parser/builder version
+        gap_tolerance_s: max gap (seconds) to stay in the same group
+
+    Returns:
+        list of Group (concrete: GroupV1 for V1)
+    """
+    v = version or latest_version()
+    spec = get_spec(v)
+    fn = resolve("build_groups", v)
+    return fn(root, spec=spec, gap_tolerance_s=gap_tolerance_s)

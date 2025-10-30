@@ -1,8 +1,6 @@
 
 from __future__ import annotations
 
-import re
-
 from rivcam.parsers import IODoc
 from rivcam.parsers import ParserSpec
 from rivcam.parsers import Version

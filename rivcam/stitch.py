@@ -7,6 +7,8 @@ from typing import Dict, List, Sequence, Tuple
 
 from rivcam.common import ClipV1, Group, GroupV1
 from rivcam.ffmpeg_runner import ConcatEntry, Segment, concat_copy_demuxer, frame_duration_sec, trim_and_concat_encode
+from rivcam.manifest import ManifestCamera, ManifestGroup, ManifestSegment, write_group_manifest
+from rivcam.parsers import Version
 from rivcam.utils.logging import LOGGER
 from rivcam.utils.paths import ensure_dir
 
@@ -14,8 +16,8 @@ from rivcam.utils.paths import ensure_dir
 @dataclass(frozen=True)
 class _Seg:
     path: Path
-    t_rel: float  # start time relative to group start (seconds)
-    ss: float     # start time within the source file (seconds)
+    t_rel: float
+    ss: float
     dur: float
 
 
@@ -44,7 +46,7 @@ def _build_raw_intersections(g: GroupV1, clips: List[ClipV1]) -> List[_Seg]:
     for c in clips:
         c0 = c.get_date().timestamp()
         c1 = c0 + c.duration()
-        ov = _overlap(c0, c1, g0, g1 - _EPS)  # half-open at end to avoid double last frame
+        ov = _overlap(c0, c1, g0, g1 - _EPS)
         if not ov:
             continue
         s, e = ov
@@ -70,33 +72,22 @@ def _snap_to_frame_grid(path: Path, ss: float, dur: float) -> Tuple[float, float
 
 
 def _resolve_overlaps_and_snap(segs: List[_Seg]) -> List[Segment]:
-    # Sort by timeline position (group-relative)
     segs = sorted(segs, key=lambda s: (s.t_rel, s.path.name))
     resolved: List[Segment] = []
     current_end = 0.0
     for s in segs:
-        # Trim off any portion that would overlap with already emitted output
         if s.t_rel < current_end:
             delta = current_end - s.t_rel
             ss = s.ss + delta
             dur = max(0.0, s.dur - delta)
-            t_rel = current_end
         else:
             ss = s.ss
             dur = s.dur
-            t_rel = s.t_rel
-
-        # Snap to frame grid
-        ss, dur, fd = _snap_to_frame_grid(s.path, ss, dur)
+        ss, dur, _fd = _snap_to_frame_grid(s.path, ss, dur)
         if dur <= _EPS:
             continue
-
-        # Update current_end on the group timeline
-        end_t = t_rel + dur
-        current_end = max(current_end, end_t)
-
+        current_end += dur
         resolved.append(Segment(path=s.path, start_sec=ss, dur_sec=dur))
-
     return resolved
 
 
@@ -109,15 +100,18 @@ def _as_concat_entries(segments: List[Segment]) -> List[ConcatEntry]:
     return entries
 
 
-def _stitch_camera_fast_or_fallback(out_path: Path, segments: List[Segment]) -> None:
+def _stitch_camera_fast_or_fallback(out_path: Path, segments: List[Segment]) -> Tuple[str, List[ManifestSegment]]:
     entries = _as_concat_entries(segments)
     rc = concat_copy_demuxer(entries, out_file=out_path)
     if rc == 0:
-        return
+        man_segments = [ManifestSegment(path=str(e.path), inpoint=e.inpoint, outpoint=e.outpoint) for e in entries]
+        return "copy", man_segments
     LOGGER.debug("Fast path failed (rc=%s) for %s, falling back to encode.", rc, out_path.name)
     rc2 = trim_and_concat_encode(segments, out_file=out_path, fps=None)
     if rc2 != 0:
         raise RuntimeError(f"ffmpeg failed to stitch camera to {out_path} (encode fallback rc={rc2})")
+    man_segments = [ManifestSegment(path=str(s.path), start_sec=s.start_sec, dur_sec=s.dur_sec) for s in segments]
+    return "encode", man_segments
 
 
 def stitch_group(out_base: Path, group: Group, *, exact: bool = True) -> Path:
@@ -128,6 +122,8 @@ def stitch_group(out_base: Path, group: Group, *, exact: bool = True) -> Path:
     gdir = ensure_dir(out_base / group.name)
 
     cams = _group_clips_by_camera(group)
+    camera_manifests: List[ManifestCamera] = []
+
     for cam, clips in cams.items():
         raw = _build_raw_intersections(group, clips)
         if not raw:
@@ -139,7 +135,21 @@ def stitch_group(out_base: Path, group: Group, *, exact: bool = True) -> Path:
             continue
         out_path = gdir / f"{cam}.mp4"
         LOGGER.info("Stitching %s (%d segs) → %s", cam, len(segs), out_path)
-        _stitch_camera_fast_or_fallback(out_path, segs)
+        method, man_segments = _stitch_camera_fast_or_fallback(out_path, segs)
+        camera_manifests.append(ManifestCamera(camera=cam, output=str(out_path), method=method, segments=man_segments))
+
+    if camera_manifests:
+        mg = ManifestGroup(
+            version=str(Version.V1.name),
+            name=group.name,
+            folder=str(group.folder),
+            start_utc=group.start_utc.isoformat(),
+            end_utc=group.end_utc.isoformat(),
+            approx_length_sec=group.approximate_length(),
+            cameras=sorted(list(set(c.camera for c in camera_manifests))),
+            outputs=camera_manifests,
+        )
+        write_group_manifest(gdir / "manifest.json", mg)
 
     return gdir
 
