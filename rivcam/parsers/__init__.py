@@ -31,6 +31,7 @@ class ParserSpec:
     io: IODoc
     clip_type: Type
     group_type: Type
+    dev_stitch_enabled: bool = False
 
     def _parse_filename_bits(self, path: Path) -> Optional[Tuple[dt.datetime, str]]:
         m = self.pattern.match(path.name)

@@ -17,6 +17,7 @@ from common_utils import (
     print_groups_table,
     setup_logger,
     build_clip_filename_start_ffprobe_len,  # <<< use filename start + ffprobe duration
+    normalize_camera_id,
 )
 
 SUPPORTED_EXT = {".mp4", ".mov", ".m4v"}
@@ -25,8 +26,8 @@ SUPPORTED_EXT = {".mp4", ".mov", ".m4v"}
 def _camera_from_name(path: Path) -> str:
     name = path.stem
     if "_video_" in name:
-        return name.split("_video_", 1)[1]
-    return "camera"
+        return normalize_camera_id(name.split("_video_", 1)[1])
+    return normalize_camera_id("camera")
 
 
 def _filename_to_utc(path: Path) -> Optional[dt.datetime]:

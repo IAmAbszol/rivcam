@@ -1,13 +1,26 @@
-
+# rivcam/stitch.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+import shutil
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from rivcam.common import ClipV1, Group, GroupV1
-from rivcam.ffmpeg_runner import ConcatEntry, Segment, concat_copy_demuxer, frame_duration_sec, trim_and_concat_encode
-from rivcam.manifest import ManifestCamera, ManifestGroup, ManifestSegment, write_group_manifest
+from rivcam.ffmpeg_runner import (
+    ConcatEntry,
+    Segment,
+    concat_copy_demuxer,
+    frame_duration_sec,
+    probe_duration_seconds,
+    trim_and_concat_encode,
+)
+from rivcam.manifest import (
+    ManifestCamera,
+    ManifestGroup,
+    ManifestSegment,
+    write_group_manifest,
+)
 from rivcam.parsers import Version
 from rivcam.utils.logging import LOGGER
 from rivcam.utils.paths import ensure_dir
@@ -22,6 +35,15 @@ class _Seg:
 
 
 _EPS = 1e-3
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        LOGGER.warning("Failed removing partial output %s: %s", path, exc)
 
 
 def _group_clips_by_camera(g: GroupV1) -> Dict[str, List[ClipV1]]:
@@ -114,7 +136,13 @@ def _stitch_camera_fast_or_fallback(out_path: Path, segments: List[Segment]) -> 
     return "encode", man_segments
 
 
-def stitch_group(out_base: Path, group: Group, *, exact: bool = True) -> Path:
+def stitch_group(
+    out_base: Path,
+    group: Group,
+    *,
+    exact: bool = True,
+    cleanup_on_failure: bool = False,
+) -> Path:
     if not isinstance(group, GroupV1):
         raise RuntimeError("Only GroupV1 is supported currently.")
     group.validate()
@@ -135,7 +163,25 @@ def stitch_group(out_base: Path, group: Group, *, exact: bool = True) -> Path:
             continue
         out_path = gdir / f"{cam}.mp4"
         LOGGER.info("Stitching %s (%d segs) → %s", cam, len(segs), out_path)
-        method, man_segments = _stitch_camera_fast_or_fallback(out_path, segs)
+        try:
+            method, man_segments = _stitch_camera_fast_or_fallback(out_path, segs)
+        except Exception as exc:
+            LOGGER.error("Failed stitching camera %s in %s: %s", cam, group.name, exc)
+            if cleanup_on_failure:
+                _safe_unlink(out_path)
+            continue
+        raw_total_s = sum(c.duration() for c in clips)
+        kept_total_s = sum(s.dur_sec for s in segs)
+        stitched_total_s = probe_duration_seconds(out_path) if out_path.exists() else 0.0
+        trimmed_total_s = max(0.0, raw_total_s - kept_total_s)
+        LOGGER.info(
+            "Overlap accounting %s: raw_sum=%.3fs kept=%.3fs stitched=%.3fs trimmed=%.3fs",
+            cam,
+            raw_total_s,
+            kept_total_s,
+            stitched_total_s,
+            trimmed_total_s,
+        )
         camera_manifests.append(ManifestCamera(camera=cam, output=str(out_path), method=method, segments=man_segments))
 
     if camera_manifests:
@@ -150,10 +196,313 @@ def stitch_group(out_base: Path, group: Group, *, exact: bool = True) -> Path:
             outputs=camera_manifests,
         )
         write_group_manifest(gdir / "manifest.json", mg)
+    elif cleanup_on_failure:
+        try:
+            shutil.rmtree(gdir, ignore_errors=True)
+        except Exception:
+            pass
 
     return gdir
 
 
-def stitch_groups(out_base: Path, groups: Sequence[Group], *, exact: bool = True) -> None:
+@dataclass(frozen=True)
+class DevCv2Options:
+    tail_seconds: float = 4.0
+    head_seconds: float = 4.0
+    resize_w: int = 160
+    resize_h: int = 90
+    sample_every: int = 3
+    min_match_frames: int = 8
+    score_threshold: float = 12.0
+    use_timestamp_hint: bool = True
+    hint_slack_seconds: float = 1.5
+    max_hint_seconds: float = 20.0
+
+
+@dataclass(frozen=True)
+class _DevOverlapResult:
+    skip_frames: int
+    score: float
+    matched_frames: int
+    used_hint: bool
+
+
+def stitch_groups(
+    out_base: Path,
+    groups: Sequence[Group],
+    *,
+    exact: bool = True,
+    dev: bool = False,
+    dev_opts: Optional[DevCv2Options] = None,
+    cleanup_on_failure: bool = False,
+) -> None:
+    if dev:
+        _dev_cv2_stitch_groups(
+            out_base,
+            groups,
+            dev_opts=dev_opts or DevCv2Options(),
+            cleanup_on_failure=cleanup_on_failure,
+        )
+        return
     for g in groups:
-        stitch_group(out_base, g, exact=exact)
+        try:
+            stitch_group(out_base, g, exact=exact, cleanup_on_failure=cleanup_on_failure)
+        except Exception as exc:
+            LOGGER.error("Failed stitching group %s: %s", getattr(g, "name", "<unknown>"), exc)
+            if cleanup_on_failure:
+                try:
+                    shutil.rmtree(out_base / g.name, ignore_errors=True)
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# DEV-ONLY: OpenCV content-based overlap detection
+# ---------------------------------------------------------------------------
+
+def _dev_cv2_stitch_groups(
+    out_base: Path,
+    groups: Sequence[Group],
+    *,
+    dev_opts: DevCv2Options,
+    cleanup_on_failure: bool = False,
+) -> None:
+    for g in groups:
+        try:
+            _dev_cv2_stitch_group(out_base, g, dev_opts=dev_opts)
+        except Exception as exc:
+            LOGGER.error("DEV stitch failed for group %s: %s", getattr(g, "name", "<unknown>"), exc)
+            if cleanup_on_failure:
+                try:
+                    shutil.rmtree(out_base / g.name, ignore_errors=True)
+                except Exception:
+                    pass
+
+
+def _dev_cv2_stitch_group(out_base: Path, group: Group, *, dev_opts: DevCv2Options) -> Path:
+    try:
+        import cv2
+    except Exception as exc:  # pragma: no cover - depends on local environment
+        raise RuntimeError("OpenCV dev stitch requested but 'cv2' is not installed.") from exc
+
+    if not isinstance(group, GroupV1):
+        raise RuntimeError("Only GroupV1 is supported currently.")
+    group.validate()
+
+    gdir = ensure_dir(out_base / group.name)
+    cams = _group_clips_by_camera(group)
+
+    for cam, clips in cams.items():
+        # Content-first overlap detection with bounded search windows.
+        clips = sorted(clips, key=lambda x: (x.get_date(), x.path.name))
+        out_path = gdir / f"{cam}_dev.mp4"
+        if not clips:
+            continue
+
+        # open first clip to learn video params
+        first_cap = cv2.VideoCapture(str(clips[0].path))
+        base_fps = first_cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width = int(first_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(first_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        first_cap.release()
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(out_path), fourcc, base_fps, (width, height))
+
+        # write first clip fully
+        prev_clip: Optional[ClipV1] = None
+        for idx, c in enumerate(clips):
+            cap = cv2.VideoCapture(str(c.path))
+            if idx == 0:
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    writer.write(frame)
+                prev_clip = c
+                cap.release()
+                continue
+
+            assert prev_clip is not None
+            hint_frames: Optional[int] = None
+            if dev_opts.use_timestamp_hint:
+                hint_frames = _timestamp_overlap_hint_frames(prev_clip, c, base_fps, max_hint_s=dev_opts.max_hint_seconds)
+            ov = _dev_detect_content_overlap(
+                prev_clip.path,
+                c.path,
+                target_fps=base_fps,
+                opts=dev_opts,
+                hint_frames=hint_frames,
+            )
+            overlap_frames = ov.skip_frames
+            LOGGER.info(
+                "[DEV] %s overlap %s -> %s = %d frames (score=%.3f matched=%d hint=%s)",
+                cam,
+                prev_clip.path.name,
+                c.path.name,
+                overlap_frames,
+                ov.score,
+                ov.matched_frames,
+                "on" if ov.used_hint else "off",
+            )
+
+            # skip the overlapping frames in current clip
+            if overlap_frames > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, overlap_frames)
+
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                writer.write(frame)
+
+            prev_clip = c
+            cap.release()
+
+        writer.release()
+        LOGGER.info("[DEV] content-based stitched %s → %s", cam, out_path)
+
+    return gdir
+
+
+def _timestamp_overlap_hint_frames(prev_clip: ClipV1, curr_clip: ClipV1, fps: float, *, max_hint_s: float) -> int:
+    prev_end = prev_clip.get_date().timestamp() + prev_clip.duration()
+    curr_start = curr_clip.get_date().timestamp()
+    overlap_s = max(0.0, prev_end - curr_start)
+    overlap_s = min(overlap_s, max_hint_s)
+    return int(round(overlap_s * max(1.0, fps)))
+
+
+def _collect_sampled_gray_frames(
+    cap,
+    *,
+    start_frame: int,
+    frame_count: int,
+    sample_every: int,
+    resize_w: int,
+    resize_h: int,
+) -> List:
+    import cv2
+
+    out: List = []
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, start_frame))
+    for i in range(max(0, frame_count)):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if i % sample_every != 0:
+            continue
+        frame = cv2.resize(frame, (resize_w, resize_h))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        out.append(frame)
+    return out
+
+
+def _dev_best_overlap_offset(
+    prev_tail: List,
+    curr_head: List,
+    *,
+    min_offset: int,
+    max_offset: int,
+    min_match_frames: int,
+) -> Optional[Tuple[int, float, int]]:
+    import numpy as np
+
+    if not prev_tail or not curr_head:
+        return None
+    max_offset = min(max_offset, len(curr_head) - 1)
+    if max_offset < min_offset:
+        return None
+
+    best: Optional[Tuple[int, float, int]] = None
+    for off in range(min_offset, max_offset + 1):
+        m = min(len(prev_tail), len(curr_head) - off)
+        if m < min_match_frames:
+            continue
+        tail = prev_tail[-m:]
+        head = curr_head[off:off + m]
+        score = 0.0
+        for a, b in zip(tail, head):
+            score += float(np.abs(a.astype("int16") - b.astype("int16")).mean())
+        score /= float(m)
+        if best is None or score < best[1]:
+            best = (off, score, m)
+    return best
+
+
+def _dev_detect_content_overlap(
+    prev_path: Path,
+    curr_path: Path,
+    *,
+    target_fps: float = 30.0,
+    opts: DevCv2Options,
+    hint_frames: Optional[int] = None,
+) -> _DevOverlapResult:
+    import cv2
+
+    step = max(1, int(opts.sample_every))
+
+    prev_cap = cv2.VideoCapture(str(prev_path))
+    curr_cap = cv2.VideoCapture(str(curr_path))
+
+    prev_fps = prev_cap.get(cv2.CAP_PROP_FPS) or target_fps
+    curr_fps = curr_cap.get(cv2.CAP_PROP_FPS) or target_fps
+
+    prev_total = int(prev_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    curr_total = int(curr_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    tail_raw = min(prev_total, int(prev_fps * opts.tail_seconds))
+    head_raw = min(curr_total, int(curr_fps * opts.head_seconds))
+    if tail_raw <= 0 or head_raw <= 0:
+        prev_cap.release()
+        curr_cap.release()
+        return _DevOverlapResult(skip_frames=0, score=9999.0, matched_frames=0, used_hint=False)
+
+    prev_tail = _collect_sampled_gray_frames(
+        prev_cap,
+        start_frame=max(0, prev_total - tail_raw),
+        frame_count=tail_raw,
+        sample_every=step,
+        resize_w=opts.resize_w,
+        resize_h=opts.resize_h,
+    )
+    curr_head = _collect_sampled_gray_frames(
+        curr_cap,
+        start_frame=0,
+        frame_count=head_raw,
+        sample_every=step,
+        resize_w=opts.resize_w,
+        resize_h=opts.resize_h,
+    )
+    prev_cap.release()
+    curr_cap.release()
+
+    if not prev_tail or not curr_head:
+        return _DevOverlapResult(skip_frames=0, score=9999.0, matched_frames=0, used_hint=False)
+
+    min_off = 0
+    max_off = len(curr_head) - 1
+    used_hint = False
+    if hint_frames is not None:
+        hint_off = max(0, int(round(hint_frames / step)))
+        slack_off = max(1, int(round((opts.hint_slack_seconds * max(1.0, target_fps)) / step)))
+        min_off = max(0, hint_off - slack_off)
+        max_off = min(max_off, hint_off + slack_off)
+        used_hint = True
+
+    best = _dev_best_overlap_offset(
+        prev_tail,
+        curr_head,
+        min_offset=min_off,
+        max_offset=max_off,
+        min_match_frames=max(1, int(opts.min_match_frames)),
+    )
+    if best is None:
+        return _DevOverlapResult(skip_frames=0, score=9999.0, matched_frames=0, used_hint=used_hint)
+
+    off_samples, score, matched = best
+    if score > opts.score_threshold:
+        return _DevOverlapResult(skip_frames=0, score=score, matched_frames=matched, used_hint=used_hint)
+
+    skip_frames = max(0, off_samples * step)
+    return _DevOverlapResult(skip_frames=skip_frames, score=score, matched_frames=matched, used_hint=used_hint)

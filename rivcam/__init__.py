@@ -49,6 +49,7 @@ register_spec(
         ),
         clip_type=ClipV1,
         group_type=GroupV1,
+        dev_stitch_enabled=True,
     )
 )
 

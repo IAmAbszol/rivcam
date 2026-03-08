@@ -18,6 +18,14 @@ LOGGER: logging.Logger = logging.getLogger("rivian")
 FILENAME_TS_RE = re.compile(
     r"(?P<mm>\d{2})_(?P<dd>\d{2})_(?P<yy>\d{2})_(?P<hh>\d{2})(?P<mi>\d{2})(?P<ss>\d{2})"
 )
+_CAMERA_ALIASES = {
+    "frontcenter": "frontCenter",
+    "rearcenter": "rearCenter",
+    "sideleft": "sideLeft",
+    "sideright": "sideRight",
+    "gearguard": "gearGuard",
+}
+_CAMERA_SUFFIX_RE = re.compile(r"(?:_t)+$", re.IGNORECASE)
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -163,6 +171,7 @@ def parse_filename_timestamp(path: Path) -> Optional[dt.datetime]:
     m = FILENAME_TS_RE.search(path.stem)
     if not m:
         return None
+
     try:
         mm = int(m.group("mm"))
         dd = int(m.group("dd"))
@@ -175,6 +184,13 @@ def parse_filename_timestamp(path: Path) -> Optional[dt.datetime]:
         return dt_utc
     except Exception:
         return None
+
+
+def normalize_camera_id(raw: str) -> str:
+    """Normalize camera token to canonical names used by the pipeline."""
+    token = _CAMERA_SUFFIX_RE.sub("", str(raw or ""))
+    key = token.replace("-", "").replace("_", "").lower()
+    return _CAMERA_ALIASES.get(key, token)
 
 
 def choose_start_utc(path: Path, ffprobe_info: Optional[Dict[str, Any]]) -> Tuple[Optional[dt.datetime], str, str]:
@@ -518,7 +534,6 @@ def build_filter_complex(template: Dict[str, Any]) -> Tuple[str, List[str]]:
     Returns:
         Tuple[str, List[str]]: (filter_complex, input_video_labels)
     """
-    canvas = template["canvas"]
     layers = template["layers"]
 
     chains: List[str] = []
@@ -537,14 +552,37 @@ def build_filter_complex(template: Dict[str, Any]) -> Tuple[str, List[str]]:
         x = int(layer["x"])
         y = int(layer["y"])
         t = layer.get("transpose", None)
+        mirror = bool(layer.get("mirror", layer.get("hflip", False)))
+        stretch_w = layer.get("stretch_w")
+        pan_x = layer.get("pan_x")
+        auto_crop_y = layer.get("auto_crop_y")
 
         in_lbl = f"{idx}:v"
         cur = f"v{idx-1}"
-        chain = f"[{in_lbl}]"
+        ops: List[str] = []
         if t is not None:
-            chain += f"transpose={int(t)},"
-        chain += f"scale={w}:{h}[{cur}]"
-        chains.append(chain)
+            ops.append(f"transpose={int(t)}")
+        if mirror:
+            ops.append("hflip")
+
+        needs_pan_crop = stretch_w is not None or pan_x is not None or auto_crop_y is not None
+        scaled_w = w
+        if stretch_w is not None:
+            scaled_w = max(w, int(stretch_w))
+            ops.append(f"scale={scaled_w}:{h}")
+        else:
+            ops.append(f"scale={w}:{h}")
+
+        if needs_pan_crop:
+            crop_x = int(pan_x) if pan_x is not None else max(0, (scaled_w - w) // 2)
+            crop_y = int(auto_crop_y) if auto_crop_y is not None else 0
+            max_x = max(0, scaled_w - w)
+            max_y = 0
+            crop_x = max(0, min(crop_x, max_x))
+            crop_y = max(0, min(crop_y, max_y))
+            ops.append(f"crop={w}:{h}:{crop_x}:{crop_y}")
+
+        chains.append(f"[{in_lbl}]{','.join(ops)}[{cur}]")
 
         # CRITICAL FIX: add :shortest=1 to every overlay hop so timeline is driven by real footage
         chains.append(f"[{last}][{cur}]overlay=x={x}:y={y}:shortest=1[ov{idx}]")
@@ -588,10 +626,14 @@ def render_composite_preview(
     for layer in template["layers"]:
         key = str(layer["key"])
         p = files.get(key)
-        if not p:
-            LOGGER.warning("Missing file for key '%s' in %s", key, str(group_dir))
-            return False
-        inputs.extend(["-ss", f"{timestamp_seconds:.3f}", "-i", str(p)])
+        if p and p.exists():
+            inputs.extend(["-ss", f"{timestamp_seconds:.3f}", "-i", str(p)])
+            continue
+        # Keep rendering even if a camera file is missing by inserting a black filler stream.
+        lw = int(layer.get("w", w))
+        lh = int(layer.get("h", h))
+        LOGGER.warning("Missing file for key '%s' in %s; using black filler.", key, str(group_dir))
+        inputs.extend(["-f", "lavfi", "-i", f"color=size={lw}x{lh}:color=black:rate=30"])
 
     fc, _ = build_filter_complex(template)
     cmd = [

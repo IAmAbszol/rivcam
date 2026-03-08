@@ -15,8 +15,9 @@
       "x": 0,
       "y": 0,
       "transpose": 2,
-      "stretch_w": 2700,
-      "pan_x": 1031,
+      "mirror": false,
+      "stretch_w": 0,
+      "pan_x": 1400,
       "auto_crop_y": 0
     },
     {
@@ -26,7 +27,8 @@
       "x": 1280,
       "y": 0,
       "transpose": 1,
-      "stretch_w": 2392,
+      "mirror": false,
+      "stretch_w": 0,
       "pan_x": 405,
       "auto_crop_y": 0
     },

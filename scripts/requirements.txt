@@ -1,2 +1,5 @@
 gpxpy==1.6.2
 tqdm==4.67.1
+ffmpeg-python==0.2.0
+ffmpeg-progress-yield==1.0.3
+opencv-python==4.10.0.84

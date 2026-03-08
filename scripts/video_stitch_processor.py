@@ -25,6 +25,7 @@ import argparse
 import datetime as dt
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ from common_utils import (
     print_groups_table,
     run_ffprobe_json,
     setup_logger,
+    normalize_camera_id,
 )
 
 # ------------------------- constants / tolerances --------------------------- #
@@ -151,6 +153,13 @@ class _Probe:
     dur_s: float     # real media duration (from ffprobe)
     end_s: float     # start_s + dur_s
 
+
+@dataclass(frozen=True)
+class _TrimPlan:
+    spans: List[Tuple[Path, float, float]]
+    raw_total_s: float
+    kept_total_s: float
+
 def _probe_clip_real(c: Clip) -> Optional[_Probe]:
     """
     Build a real-timing probe for overlap trimming:
@@ -184,7 +193,7 @@ def _probe_clip_real(c: Clip) -> Optional[_Probe]:
     dur_s = float(dur)
     return _Probe(path=c.path, start_s=start_s, dur_s=dur_s, end_s=start_s + dur_s)
 
-def _build_trim_spans(clips: List[Clip], tolerance_s: float) -> List[Tuple[Path, float, float]]:
+def _build_trim_spans(clips: List[Clip], tolerance_s: float) -> _TrimPlan:
     """
     Produce trim spans for a single camera, removing overlaps on the filename-start timeline.
 
@@ -194,10 +203,10 @@ def _build_trim_spans(clips: List[Clip], tolerance_s: float) -> List[Tuple[Path,
       keep = max(dur - ss, MIN_KEEP)
     Gaps are preserved.
 
-    Returns list of (path, ss, dur).
+    Returns trim plan with spans and timing totals.
     """
     if not clips:
-        return []
+        return _TrimPlan(spans=[], raw_total_s=0.0, kept_total_s=0.0)
 
     probes: List[_Probe] = []
     for c in clips:
@@ -205,7 +214,7 @@ def _build_trim_spans(clips: List[Clip], tolerance_s: float) -> List[Tuple[Path,
         if p:
             probes.append(p)
     if not probes:
-        return []
+        return _TrimPlan(spans=[], raw_total_s=0.0, kept_total_s=0.0)
 
     probes.sort(key=lambda p: p.start_s)
 
@@ -231,7 +240,9 @@ def _build_trim_spans(clips: List[Clip], tolerance_s: float) -> List[Tuple[Path,
         spans.append((p.path, ss, keep))
         prev_end = max(prev_end, p.start_s + ss + keep)
 
-    return spans
+    raw_total_s = sum(p.dur_s for p in probes)
+    kept_total_s = sum(d for _, _, d in spans)
+    return _TrimPlan(spans=spans, raw_total_s=raw_total_s, kept_total_s=kept_total_s)
 
 # ------------------------- camera/group plumbing ---------------------------- #
 
@@ -244,7 +255,7 @@ def _bucket_by_camera(clips: List[Clip]) -> Dict[str, List[Clip]]:
     buckets: Dict[str, List[Clip]] = {}
     for c in clips:
         m = key_re.search(c.path.stem)
-        cam = m.group(1) if m else "camera"
+        cam = normalize_camera_id(m.group(1) if m else "camera")
         buckets.setdefault(cam, []).append(c)
     for v in buckets.values():
         v.sort(key=lambda x: (x.start_utc, x.path.name))
@@ -264,32 +275,56 @@ def _stitch_camera(out_dir: Path, cam: str, clips: List[Clip], keep_tmp: bool, t
     ensure_dir(out_dir)
     tmp_dir = out_dir / f"_{cam}_segs"
     ensure_dir(tmp_dir)
+    out_path = out_dir / f"{cam}.mp4"
 
-    spans = _build_trim_spans(clips, tolerance_s=tolerance_s)
+    plan = _build_trim_spans(clips, tolerance_s=tolerance_s)
+    spans = plan.spans
     if not spans:
         LOGGER.warning("No spans produced for %s", cam)
         return False
 
     seg_paths: List[Path] = []
+    concat_txt = tmp_dir / "concat.txt"
+
+    def _cleanup_failed_artifacts() -> None:
+        for p in seg_paths:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        try:
+            concat_txt.unlink()
+        except Exception:
+            pass
+        try:
+            out_path.unlink()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
     try:
         for i, (src, ss, dur) in enumerate(spans, 1):
             seg = tmp_dir / f"{i:03d}.mp4"
             rc = _ffmpeg_trim_copy(src, ss, dur, seg)
             if rc != 0 or not seg.exists() or seg.stat().st_size == 0:
                 LOGGER.error("ffmpeg trim failed: %s (ss=%.3f, dur=%.3f)", src, ss, dur)
+                _cleanup_failed_artifacts()
                 return False
             seg_paths.append(seg)
 
         if not seg_paths:
             LOGGER.warning("No segments for %s", cam)
+            _cleanup_failed_artifacts()
             return False
 
-        concat_txt = tmp_dir / "concat.txt"
         _write_concat_file(seg_paths, concat_txt)
-        out_path = out_dir / f"{cam}.mp4"
         rc = _ffmpeg_concat_copy(concat_txt, out_path)
         if rc != 0 or not out_path.exists() or out_path.stat().st_size == 0:
             LOGGER.error("ffmpeg concat failed: %s", out_path)
+            _cleanup_failed_artifacts()
             return False
 
         # Optionally clean tmp
@@ -308,7 +343,18 @@ def _stitch_camera(out_dir: Path, cam: str, clips: List[Clip], keep_tmp: bool, t
             except Exception:
                 pass
 
-        LOGGER.info("Stitched %s → %s", cam, out_path)
+        stitched_info = run_ffprobe_json(out_path)
+        stitched_s = ffprobe_duration_seconds(stitched_info) or 0.0
+        trimmed_s = max(0.0, plan.raw_total_s - plan.kept_total_s)
+        LOGGER.info(
+            "Stitched %s → %s | overlap raw_sum=%.3fs kept=%.3fs stitched=%.3fs trimmed=%.3fs",
+            cam,
+            out_path,
+            plan.raw_total_s,
+            plan.kept_total_s,
+            stitched_s,
+            trimmed_s,
+        )
         return True
     finally:
         # leave tmp if requested; nothing else to do here

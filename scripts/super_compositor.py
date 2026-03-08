@@ -20,12 +20,14 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from common_utils import (
     LOGGER,
@@ -48,6 +50,25 @@ except Exception:
     tqdm = None
 
 DEFAULT_TEMPLATE_NAME = "default_template.json"
+_AUTO_DISABLE_VIDEOTOOLBOX = False
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except Exception:
+        pass
+
+
+def _natural_key(s: str) -> List[Any]:
+    parts = re.split(r"(\d+)", s)
+    out: List[Any] = []
+    for p in parts:
+        if p.isdigit():
+            out.append(int(p))
+        else:
+            out.append(p.lower())
+    return out
 
 
 def _write_default_template(path: Path) -> None:
@@ -59,13 +80,9 @@ def _write_default_template(path: Path) -> None:
     tpl = {
         "canvas": {"w": 1920, "h": 1080},
         "layers": [
-            # Rear panorama → bottom strip
             {"key": "rearCenter", "w": 1920, "h": 619, "x": 0, "y": 540},
-            # Left (rotated) → bottom-left
-            {"key": "sideLeft", "w": 648, "h": 648, "x": 0, "y": 540, "transpose": 2},
-            # Right (rotated) → bottom-right
-            {"key": "sideRight", "w": 648, "h": 648, "x": 1272, "y": 432, "transpose": 1},
-            # Front → top center
+            {"key": "sideLeft", "w": 640, "h": 1080, "x": 0, "y": 0, "transpose": 2, "mirror": True, "stretch_w": 2700, "pan_x": 1056, "auto_crop_y": 0},
+            {"key": "sideRight", "w": 640, "h": 1080, "x": 1280, "y": 0, "transpose": 1, "stretch_w": 2392, "pan_x": 405, "auto_crop_y": 0},
             {"key": "frontCenter", "w": 640, "h": 540, "x": 640, "y": 0},
         ],
     }
@@ -123,7 +140,7 @@ def _ffprobe_shortest_duration(files: List[Path]) -> Optional[float]:
 
 
 def _build_ffmpeg_inputs(group_dir: Path, template: Dict[str, Any], preview_seek: float = 0.0) -> Tuple[List[str], List[Path]]:
-    """Build ffmpeg input args (color + cameras) and return the ordered file list."""
+    """Build ffmpeg input args (color + cameras/fillers) and return existing file order."""
     cw = int(template["canvas"]["w"])
     ch = int(template["canvas"]["h"])
 
@@ -136,15 +153,19 @@ def _build_ffmpeg_inputs(group_dir: Path, template: Dict[str, Any], preview_seek
     for layer in layers:
         key = str(layer["key"])
         fp = files.get(key)
-        if not fp or not fp.exists():
-            raise FileNotFoundError(f"Missing file for template key '{key}' in {group_dir}")
-        # Per-input queue to avoid sync starvation on macOS
-        inputs += ["-thread_queue_size", "2048", "-ss", f"{preview_seek:.3f}", "-i", str(fp)]
-        file_order.append(fp)
+        if fp and fp.exists():
+            # Per-input queue to avoid sync starvation on macOS
+            inputs += ["-thread_queue_size", "2048", "-ss", f"{preview_seek:.3f}", "-i", str(fp)]
+            file_order.append(fp)
+            continue
+        lw = int(layer.get("w", cw))
+        lh = int(layer.get("h", ch))
+        LOGGER.warning("Missing file for key '%s' in %s; using black filler.", key, group_dir.name)
+        inputs += ["-f", "lavfi", "-i", f"color=size={lw}x{lh}:color=black:rate=30"]
     return inputs, file_order
 
 
-def _run_ffmpeg_with_progress(cmd: List[str], est_seconds: Optional[float]) -> int:
+def _run_ffmpeg_with_progress(cmd: List[str], est_seconds: Optional[float]) -> Tuple[int, str]:
     """Run ffmpeg and show progress via tqdm (if available) or log updates.
 
     Fix: avoid stdout deadlock, parse '-progress pipe:2', break on 'progress=end',
@@ -181,6 +202,7 @@ def _run_ffmpeg_with_progress(cmd: List[str], est_seconds: Optional[float]) -> i
     bar = None
     last_pct = -1
     start = time.time()
+    err_tail: List[str] = []
 
     try:
         if tqdm is not None and est_seconds and est_seconds > 0:
@@ -191,6 +213,10 @@ def _run_ffmpeg_with_progress(cmd: List[str], est_seconds: Optional[float]) -> i
         for raw in proc.stderr:
             line = raw.strip()
             if not line or "=" not in line:
+                if line:
+                    err_tail.append(line)
+                    if len(err_tail) > 200:
+                        err_tail.pop(0)
                 continue
             key, val = line.split("=", 1)
 
@@ -218,6 +244,10 @@ def _run_ffmpeg_with_progress(cmd: List[str], est_seconds: Optional[float]) -> i
                     break
                 if val == "error":
                     break
+            else:
+                err_tail.append(line)
+                if len(err_tail) > 200:
+                    err_tail.pop(0)
     finally:
         if bar is not None:
             bar.close()
@@ -231,7 +261,99 @@ def _run_ffmpeg_with_progress(cmd: List[str], est_seconds: Optional[float]) -> i
         except subprocess.TimeoutExpired:
             pass
 
-    return proc.wait() or 0
+    rc = proc.wait() or 0
+    return rc, "\n".join(err_tail[-40:])
+
+
+def _build_encode_cmd(
+    *,
+    inputs: Sequence[str],
+    filter_complex: str,
+    final_label: str,
+    out_path: Path,
+    fps: int,
+    encoder: str,
+    crf: int,
+    preset: str,
+) -> List[str]:
+    cmd: List[str] = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", final_label,
+        "-pix_fmt", "yuv420p",
+        "-r", str(fps),
+    ]
+    if encoder == "videotoolbox":
+        cmd += ["-c:v", "h264_videotoolbox", "-allow_sw", "1", "-b:v", "12M"]
+    elif encoder == "libx264":
+        cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
+    else:
+        raise ValueError(f"Unsupported encoder: {encoder}")
+
+    cmd += ["-movflags", "+faststart", "-shortest", str(out_path)]
+    return cmd
+
+
+def _concat_group_composites(group_dirs: Sequence[Path], final_out: Path) -> bool:
+    composites = [g / "composite.mp4" for g in group_dirs if (g / "composite.mp4").exists()]
+    if not composites:
+        LOGGER.warning("No per-group composite outputs found; skipping final concat.")
+        return False
+    composites = sorted(composites, key=lambda p: _natural_key(str(p)))
+    valid: List[Path] = []
+    for p in composites:
+        info = run_ffprobe_json(p)
+        dur = ffprobe_duration_seconds(info)
+        if dur and dur > 0:
+            valid.append(p)
+            continue
+        LOGGER.warning("Skipping invalid composite (ffprobe failed): %s", p)
+    if not valid:
+        LOGGER.warning("No valid composite.mp4 files available for final concat.")
+        return False
+
+    with tempfile.NamedTemporaryFile("w", suffix=".concat.txt", delete=False) as fh:
+        list_path = Path(fh.name)
+        for p in valid:
+            escaped = str(p.resolve()).replace("'", r"'\''")
+            fh.write(f"file '{escaped}'\n")
+
+    try:
+        final_out.parent.mkdir(parents=True, exist_ok=True)
+        cmd_copy = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_path),
+            "-c", "copy",
+            str(final_out),
+        ]
+        rc = subprocess.call(cmd_copy)
+        if rc == 0 and final_out.exists() and final_out.stat().st_size > 0:
+            LOGGER.info("Final composite written (stream copy): %s", final_out)
+            return True
+
+        LOGGER.warning("Final concat copy failed (rc=%s); retrying with re-encode.", rc)
+        cmd_reencode = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_path),
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+            "-an",
+            str(final_out),
+        ]
+        rc2 = subprocess.call(cmd_reencode)
+        if rc2 == 0 and final_out.exists() and final_out.stat().st_size > 0:
+            LOGGER.info("Final composite written (re-encode): %s", final_out)
+            return True
+        LOGGER.error("Final concat failed (copy rc=%s, re-encode rc=%s)", rc, rc2)
+        _safe_unlink(final_out)
+        return False
+    finally:
+        try:
+            list_path.unlink()
+        except Exception:
+            pass
 
 
 def composite_group(
@@ -239,10 +361,11 @@ def composite_group(
     template: Dict[str, Any],
     out_path: Path,
     fps: int = 30,
-    crf: int = 18,              # retained in signature; unused for videotoolbox
-    preset: str = "veryfast",   # retained in signature; unused for videotoolbox
+    crf: int = 18,
+    preset: str = "veryfast",
     preview_time: float = 0.0,
     assume_yes: bool = False,
+    encoder: str = "auto",
 ) -> bool:
     """Composite one group dir into a single MP4 using the template.
 
@@ -251,22 +374,24 @@ def composite_group(
         template: Loaded template dict (canvas + layers).
         out_path: Destination MP4 path.
         fps: Output fps (kept at 30 to match camera inputs).
-        crf: Unused for hardware encode; kept for CLI compatibility.
-        preset: Unused for hardware encode; kept for CLI compatibility.
+        crf: x264 CRF when software encode is used.
+        preset: x264 preset when software encode is used.
         preview_time: Seconds to seek for the preview frame.
         assume_yes: If True, skip prompt.
+        encoder: "auto", "videotoolbox", or "libx264".
 
     Returns:
         bool: True if composed, False if skipped or failed.
     """
-    # Preview
-    preview_png = group_dir / "preview.png"
-    if not render_composite_preview(group_dir, template, preview_png, timestamp_seconds=preview_time):
-        LOGGER.warning("Failed to render preview for %s; skipping.", str(group_dir))
-        return False
+    global _AUTO_DISABLE_VIDEOTOOLBOX
 
-    LOGGER.info("Preview written: %s", str(preview_png))
+    # Preview is only needed for interactive acceptance; skip it in -y mode for speed.
+    preview_png = group_dir / "preview.png"
     if not assume_yes:
+        if not render_composite_preview(group_dir, template, preview_png, timestamp_seconds=preview_time):
+            LOGGER.warning("Failed to render preview for %s; skipping.", str(group_dir))
+            return False
+        LOGGER.info("Preview written: %s", str(preview_png))
         if not prompt_yes_no(f"Accept composite for {group_dir.name}", default_no=True, assume_yes=False):
             LOGGER.info("Skipped by user: %s", str(group_dir))
             return False
@@ -281,26 +406,44 @@ def composite_group(
     filter_complex, _ = build_filter_complex(template)
     final_label = f"[ov{len(template['layers'])}]"
 
-    # EXACTLY mirror your successful command: h264_videotoolbox + 12M bitrate
-    cmd: List[str] = [
-        "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-map", final_label,
-        "-pix_fmt", "yuv420p",
-        "-r", str(fps),
-        "-c:v", "h264_videotoolbox", "-b:v", "12M",
-        "-movflags", "+faststart",
-        "-shortest",
-        str(out_path),
-    ]
+    if encoder not in {"auto", "videotoolbox", "libx264"}:
+        raise ValueError(f"Unsupported encoder: {encoder}")
 
-    rc = _run_ffmpeg_with_progress(cmd, est)
-    if rc != 0:
-        LOGGER.error("Composite failed for %s (rc=%s)", str(group_dir), rc)
-        return False
+    encoders: List[str]
+    if encoder == "auto":
+        encoders = ["libx264"] if _AUTO_DISABLE_VIDEOTOOLBOX else ["videotoolbox", "libx264"]
+    else:
+        encoders = [encoder]
 
-    return True
+    for enc in encoders:
+        cmd = _build_encode_cmd(
+            inputs=inputs,
+            filter_complex=filter_complex,
+            final_label=final_label,
+            out_path=out_path,
+            fps=fps,
+            encoder=enc,
+            crf=crf,
+            preset=preset,
+        )
+        rc, err_tail = _run_ffmpeg_with_progress(cmd, est)
+        if rc == 0:
+            if enc != encoders[0]:
+                LOGGER.info("Composite succeeded with encoder fallback: %s", enc)
+            return True
+        LOGGER.warning("Composite failed for %s with encoder=%s (rc=%s)", group_dir.name, enc, rc)
+        if err_tail:
+            LOGGER.warning("ffmpeg stderr tail (%s):\n%s", enc, err_tail)
+        if enc == "videotoolbox":
+            tail = (err_tail or "").lower()
+            if "cannot create compression session" in tail or "error initializing output stream" in tail:
+                _AUTO_DISABLE_VIDEOTOOLBOX = True
+                LOGGER.warning("Disabling videotoolbox for remaining groups in this run.")
+        _safe_unlink(out_path)
+
+    LOGGER.error("Composite failed for %s after trying encoder strategy '%s'.", str(group_dir), encoder)
+    _safe_unlink(out_path)
+    return False
 
 
 def main() -> None:
@@ -313,9 +456,18 @@ def main() -> None:
     ap.add_argument("--fps", type=int, default=30, help="Output fps")
     ap.add_argument("--crf", type=int, default=18, help="x264 CRF")
     ap.add_argument("--preset", type=str, default="veryfast", help="x264 preset")
+    ap.add_argument(
+        "--encoder",
+        type=str,
+        default="auto",
+        choices=["auto", "videotoolbox", "libx264"],
+        help="Encoder strategy: auto fallback, hardware-only, or software-only.",
+    )
     ap.add_argument("-y", "--yes", action="store_true", help="Assume yes on prompts")
     ap.add_argument("--preview-time", type=float, default=0.0, help="Seek (seconds) for preview frame")
     ap.add_argument("-j", "--jobs", type=int, default=1, help="Number of groups to render in parallel")
+    ap.add_argument("--final-name", type=str, default="final_composite.mp4", help="Output filename for concatenated final video.")
+    ap.add_argument("--no-final", action="store_true", help="Skip concatenating per-group composites into one final output.")
     args = ap.parse_args()
 
     setup_logger(args.log_level)
@@ -353,6 +505,7 @@ def main() -> None:
                 preset=args.preset,
                 preview_time=args.preview_time,
                 assume_yes=args.yes,
+                encoder=args.encoder,
             )
             return (gdir, bool(ok), "")
         except FileNotFoundError as e:
@@ -385,6 +538,14 @@ def main() -> None:
                         LOGGER.error(msg)
 
     LOGGER.info("Composited %d/%d group(s).", ok, len(groups))
+    if not args.no_final:
+        # Keep ordering deterministic for the final assembly.
+        ordered_groups = sorted(groups, key=lambda p: _natural_key(p.name))
+        if root.is_dir() and root.name.startswith("group_"):
+            final_out = root.parent / args.final_name
+        else:
+            final_out = root / args.final_name
+        _concat_group_composites(ordered_groups, final_out)
 
 
 if __name__ == "__main__":
