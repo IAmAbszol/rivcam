@@ -75,14 +75,15 @@ def _write_default_template(path: Path) -> None:
     """Write a sane 1920x1080 template that matches stitched filenames.
 
     The keys below must match the stitched file basenames inside each group dir:
-      frontCenter.mp4, rearCenter.mp4, sideLeft.mp4, sideRight_t.mp4, gearGuard.mp4
+      frontCenter.mp4, rearCenter.mp4, sideLeft.mp4, sideRight.mp4, gearGuard.mp4
+    (Suffix variants like *_t are normalized during file matching.)
     """
     tpl = {
         "canvas": {"w": 1920, "h": 1080},
         "layers": [
             {"key": "rearCenter", "w": 1920, "h": 619, "x": 0, "y": 540},
-            {"key": "sideLeft", "w": 640, "h": 1080, "x": 0, "y": 0, "transpose": 2, "mirror": True, "stretch_w": 2700, "pan_x": 1056, "auto_crop_y": 0},
-            {"key": "sideRight", "w": 640, "h": 1080, "x": 1280, "y": 0, "transpose": 1, "stretch_w": 2392, "pan_x": 405, "auto_crop_y": 0},
+            {"key": "sideLeft", "w": 640, "h": 1080, "x": 0, "y": 0, "transpose": 2, "mirror": False, "stretch_w": 0, "pan_x": 1400, "auto_crop_y": 0},
+            {"key": "sideRight", "w": 640, "h": 1080, "x": 1280, "y": 0, "transpose": 1, "mirror": False, "stretch_w": 0, "pan_x": 405, "auto_crop_y": 0},
             {"key": "frontCenter", "w": 640, "h": 540, "x": 640, "y": 0},
         ],
     }

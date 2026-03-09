@@ -135,7 +135,8 @@ def build_groups(
       - a root directory of media files, or
       - a pre-parsed iterable of Clip objects.
 
-    This is what your test_grouping.py and test_stitching.py call.
+    This is what the dev probe utilities call (scripts/devtools/grouping_probe.py
+    and scripts/devtools/stitch_probe.py).
 
     Args:
         root: directory or iterable of Clip

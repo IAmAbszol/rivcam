@@ -2,6 +2,11 @@
 """
 find_and_cat.py — Find files by basename regex and concatenate them with ffmpeg.
 
+DEPRECATED:
+  For primary workflows, prefer:
+    - rivcam final  (group outputs -> final)
+    - rivcam merge  (final videos -> merged output)
+
 Usage:
   python find_and_cat.py "<regex>" <directory> [--out output.mp4] [--reencode] [--dry-run]
 

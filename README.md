@@ -6,7 +6,8 @@ Rivian dashcam tooling to:
 - group clips by time window,
 - stitch per-camera timelines with overlap trimming,
 - compose group overlays from a JSON template,
-- concatenate group composites into a single final video,
+- build filtered/labeled finals from group outputs,
+- merge multiple finals into one output,
 - optionally run OpenCV dev stitch mode for content-based overlap testing.
 
 ## Python Support
@@ -48,6 +49,13 @@ Key compositor options:
 - `--final-name <name>.mp4`
 - `--no-final`
 
+## Devtools
+
+Helper probe utilities now live under `scripts/devtools/`:
+
+- `python3 scripts/devtools/grouping_probe.py <root> [--gap ...]`
+- `python3 scripts/devtools/stitch_probe.py <root> [--renders ...] [--dev]`
+
 ## `rivcam` CLI Pipeline
 
 After bootstrap:
@@ -65,10 +73,20 @@ rivcam all recordings/OffRoading --template scripts/default_template.json
 Subcommands:
 
 - `rivcam stitch <root> [--dev] [dev overlap options]`
-- `rivcam compose <stitched-root> [--template ...] [--encoder ...]`
+- `rivcam compose <stitched-root> [--template ...] [--encoder ...] [--group-output-name ...] [--no-final]`
+- `rivcam final <stitched-root> [--input-name ...] [--include-group ...] [--exclude-group ...] [--overlay-text ...]`
+- `rivcam merge <root> [--input <file> ...] [--pattern ...] [--out ...]`
 - `rivcam all <root> ...`
 
 OpenCV dev overlap options are available via `rivcam stitch --help`.
+
+Examples:
+
+```bash
+rivcam compose renders/OffRoading --template scripts/default_template.json --group-output-name composite.mp4 --no-final
+rivcam final renders/OffRoading --input-name composite.mp4 --exclude-group 1 --overlay-text "Trail 1" --final-name trail_1.mp4
+rivcam merge renders/OffRoading --input trail_1.mp4 --input trail_2.mp4 --out trails_combined.mp4
+```
 
 ## Notes
 

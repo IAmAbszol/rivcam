@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# route_processor.py — Python 3.9 compatible
+# route_processor.py — Python 3.11 compatible
 #
 # Outputs per run (under CWD):
 #   ./gps_slices/<ROOT_NAME>/group_##/route_slice.gpx
@@ -154,7 +154,7 @@ except ImportError:
     sys.exit(2)
 
 try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
+    from zoneinfo import ZoneInfo  # Python 3.11+
 except Exception:
     ZoneInfo = None
 
